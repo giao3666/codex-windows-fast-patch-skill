@@ -5,12 +5,15 @@ param(
   [switch]$VerifyOnly,
   [switch]$StrictVerifyOnly,
   [switch]$VerifyAllBundledPluginsAvailable,
-  [switch]$SkipUserEnvironment
+  [switch]$SkipUserEnvironment,
+  [switch]$SkipDesktopPipeCheck
 )
 
 $ErrorActionPreference = 'Stop'
 $LogPrefix = '[codex-computer-use-local]'
 $script:ConfigBackupBeforeOverwrite = @{}
+$script:CurrentRuntimeInventory = $null
+$script:RuntimeIdentityLogged = $false
 
 function Write-Log {
   param([string]$Message)
@@ -25,6 +28,33 @@ function Write-Utf8NoBom {
   New-Item -ItemType Directory -Force -Path (Split-Path -Parent $Path) | Out-Null
   $encoding = [System.Text.UTF8Encoding]::new($false)
   [System.IO.File]::WriteAllText($Path, $Content, $encoding)
+}
+
+function Get-TomlPython {
+  $seen = @{}
+  foreach ($commandName in @('python.exe', 'python3.exe')) {
+    foreach ($command in @(Get-Command $commandName -All -ErrorAction SilentlyContinue)) {
+      $path = [string]$command.Source
+      if (
+        [string]::IsNullOrWhiteSpace($path) -or
+        $seen.ContainsKey($path) -or
+        $path -match '(?i)[\\/]Microsoft[\\/]WindowsApps[\\/]'
+      ) {
+        continue
+      }
+      $seen[$path] = $true
+
+      try {
+        $null = @(& $path -c 'import sys, tomllib; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)' 2>&1)
+        if ($LASTEXITCODE -eq 0) {
+          return $command
+        }
+      } catch {
+        continue
+      }
+    }
+  }
+  return $null
 }
 
 function Backup-ConfigBeforeOverwrite {
@@ -166,6 +196,37 @@ function Copy-DirectoryDataOnly {
   }
 }
 
+function ConvertTo-TomlValue {
+  param([object]$Value)
+
+  if ($Value -is [bool]) {
+    return $Value.ToString().ToLowerInvariant()
+  }
+  if (
+    $Value -is [byte] -or
+    $Value -is [sbyte] -or
+    $Value -is [int16] -or
+    $Value -is [uint16] -or
+    $Value -is [int32] -or
+    $Value -is [uint32] -or
+    $Value -is [int64] -or
+    $Value -is [uint64] -or
+    $Value -is [single] -or
+    $Value -is [double] -or
+    $Value -is [decimal]
+  ) {
+    return [System.Convert]::ToString($Value, [System.Globalization.CultureInfo]::InvariantCulture)
+  }
+
+  $text = [string]$Value
+  if ($text -match '[\x00-\x1F\x7F]') {
+    throw 'TOML string values cannot contain control characters'
+  }
+
+  $escaped = $text.Replace('\', '\\').Replace('"', '\"')
+  return '"' + $escaped + '"'
+}
+
 function Set-TomlTable {
   param(
     [string]$ConfigPath,
@@ -180,20 +241,16 @@ function Set-TomlTable {
 
   $lines = foreach ($key in ($Values.Keys | Sort-Object)) {
     $value = $Values[$key]
-    if ($value -is [bool]) {
-      "$key = $($value.ToString().ToLowerInvariant())"
-    } else {
-      $escaped = [string]$value -replace "'", "''"
-      "$key = '$escaped'"
-    }
+    "$key = $(ConvertTo-TomlValue $value)"
   }
   $body = ($lines -join "`r`n") + "`r`n"
   $escapedHeader = [regex]::Escape($Header)
   $pattern = "(?ms)^$escapedHeader\s*\r?\n(?:(?!^\[).)*"
   $replacement = "$Header`r`n$body"
+  $tableMatch = [regex]::Match($content, $pattern)
 
-  if ([regex]::IsMatch($content, $pattern)) {
-    $content = [regex]::Replace($content, $pattern, $replacement, 1)
+  if ($tableMatch.Success) {
+    $content = $content.Remove($tableMatch.Index, $tableMatch.Length).Insert($tableMatch.Index, $replacement)
   } else {
     if ($content.Length -gt 0 -and -not $content.EndsWith("`n")) {
       $content += "`r`n"
@@ -205,6 +262,58 @@ function Set-TomlTable {
   }
 
   Backup-ConfigBeforeOverwrite $ConfigPath "set-$Header"
+  Write-Utf8NoBom $ConfigPath $content
+}
+
+function Set-TomlTableKey {
+  param(
+    [string]$ConfigPath,
+    [string]$Header,
+    [string]$Key,
+    [object]$Value
+  )
+
+  $content = ''
+  if (Test-Path -LiteralPath $ConfigPath -PathType Leaf) {
+    $content = [System.IO.File]::ReadAllText($ConfigPath, [System.Text.UTF8Encoding]::new($false))
+  }
+
+  $literal = ConvertTo-TomlValue $Value
+  $newline = if ($content.Contains("`r`n")) { "`r`n" } else { "`n" }
+  $escapedHeader = [regex]::Escape($Header)
+  $tablePattern = "(?ms)^$escapedHeader\s*\r?\n(?:(?!^\[).)*"
+  $tableMatch = [regex]::Match($content, $tablePattern)
+
+  if ($tableMatch.Success) {
+    $escapedKey = [regex]::Escape($Key)
+    $keyPattern = "(?m)^\s*$escapedKey\s*=.*$"
+    $keyMatches = [regex]::Matches($tableMatch.Value, $keyPattern)
+    if ($keyMatches.Count -gt 1) {
+      throw "refusing to update duplicate TOML key $Key under $Header"
+    }
+
+    if ($keyMatches.Count -eq 1) {
+      $keyMatch = $keyMatches[0]
+      $updatedTable = $tableMatch.Value.Remove($keyMatch.Index, $keyMatch.Length).Insert($keyMatch.Index, "$Key = $literal")
+    } else {
+      $updatedTable = $tableMatch.Value
+      if (-not $updatedTable.EndsWith("`n")) {
+        $updatedTable += $newline
+      }
+      $updatedTable += "$Key = $literal$newline"
+    }
+    $content = $content.Remove($tableMatch.Index, $tableMatch.Length).Insert($tableMatch.Index, $updatedTable)
+  } else {
+    if ($content.Length -gt 0 -and -not $content.EndsWith("`n")) {
+      $content += $newline
+    }
+    if ($content.Length -gt 0 -and -not $content.EndsWith("$newline$newline")) {
+      $content += $newline
+    }
+    $content += "$Header$newline$Key = $literal$newline"
+  }
+
+  Backup-ConfigBeforeOverwrite $ConfigPath "set-$Header-$Key"
   Write-Utf8NoBom $ConfigPath $content
 }
 
@@ -885,18 +994,15 @@ function Update-CodexConfig {
     source = $source
     source_type = 'local'
   }
-  Set-TomlTable $configPath '[plugins."computer-use@openai-bundled"]' @{
-    enabled = $true
-  }
-  Set-TomlTable $configPath '[plugins."browser@openai-bundled"]' @{
-    enabled = $true
-  }
-  Set-TomlTable $configPath '[plugins."chrome@openai-bundled"]' @{
-    enabled = $true
-  }
-  Set-TomlTable $configPath '[windows]' @{
-    sandbox = 'unelevated'
-  }
+  Set-TomlTableKey $configPath '[plugins."computer-use@openai-bundled"]' 'enabled' $true
+  Set-TomlTableKey $configPath '[plugins."browser@openai-bundled"]' 'enabled' $true
+  Set-TomlTableKey $configPath '[plugins."chrome@openai-bundled"]' 'enabled' $true
+  Set-TomlTableKey $configPath '[features]' 'computer_use' $true
+  Set-TomlTableKey $configPath '[windows]' 'sandbox' 'unelevated'
+  Remove-TomlTableKeys $configPath '[features]' @(
+    'js_repl',
+    'js_repl_tools_only'
+  ) 'remove-retired-js-repl-features'
   $pipeState = Get-ComputerUsePipeConfigState $configPath
   if ($pipeState.Present -and $pipeState.Active) {
     Write-Log "preserving active Computer Use pipe config: $($pipeState.PipePath)"
@@ -911,9 +1017,9 @@ function Update-CodexConfig {
 function Test-TomlSyntax {
   param([string]$ConfigPath)
 
-  $python = Get-Command python -ErrorAction SilentlyContinue | Select-Object -First 1
+  $python = Get-TomlPython
   if (-not $python) {
-    Write-Log 'warning: python not found; skipping tomllib syntax validation'
+    Write-Log 'warning: no usable Python 3.11+ interpreter found outside WindowsApps; skipping tomllib syntax validation'
     return
   }
 
@@ -938,51 +1044,31 @@ tomllib.loads(path.read_text(encoding="utf-8"))
 }
 
 function Get-CuaSkyRuntimeRoot {
-  $runtimeRoot = Join-Path $env:LOCALAPPDATA 'OpenAI\Codex\runtimes\cua_node'
-  $candidates = @()
+  $inventory = $script:CurrentRuntimeInventory
+  if (-not $inventory) {
+    $inventory = Get-CurrentCodexAppServerRuntimeInventory
+  }
 
-  if (Test-Path -LiteralPath $runtimeRoot -PathType Container) {
-    $candidates += foreach ($runtime in (Get-ChildItem -LiteralPath $runtimeRoot -Directory -ErrorAction SilentlyContinue)) {
-      $skyRoot = Join-Path $runtime.FullName 'bin\node_modules\@oai\sky'
-      $basePath = Join-Path $skyRoot 'dist\project\cua\sky_js\src\targets\windows\internal\computer_use_client_base.js'
-      $packagePath = Join-Path $skyRoot 'package.json'
-      if ((Test-Path -LiteralPath $basePath -PathType Leaf) -and (Test-Path -LiteralPath $packagePath -PathType Leaf)) {
-        $packageItem = Get-Item -LiteralPath $packagePath
-        [pscustomobject]@{
-          Path = $skyRoot
-          LastWriteTime = $packageItem.LastWriteTime
-          Priority = 0
-        }
-      }
+  $binRoot = Split-Path -Parent $inventory.NodePath
+  $runtimeRoot = Split-Path -Parent $binRoot
+  $runtimeId = Split-Path -Leaf $runtimeRoot
+  $skyRoot = Join-Path $binRoot 'node_modules\@oai\sky'
+  $required = @(
+    (Join-Path $skyRoot 'package.json'),
+    (Join-Path $skyRoot 'dist\project\cua\sky_js\src\index.js'),
+    (Join-Path $skyRoot 'dist\project\cua\sky_js\src\targets\windows\internal\computer_use_client_base.js')
+  )
+  foreach ($path in $required) {
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+      throw "current package-matching CUA runtime is incomplete: $path"
     }
   }
 
-  $pkg = Get-AppxPackage -Name OpenAI.Codex -ErrorAction SilentlyContinue |
-    Sort-Object Version -Descending |
-    Select-Object -First 1
-  if ($pkg) {
-    $packageSkyRoot = Join-Path $pkg.InstallLocation 'app\resources\cua_node\bin\node_modules\@oai\sky'
-    $packageBasePath = Join-Path $packageSkyRoot 'dist\project\cua\sky_js\src\targets\windows\internal\computer_use_client_base.js'
-    $packagePath = Join-Path $packageSkyRoot 'package.json'
-    if ((Test-Path -LiteralPath $packageBasePath -PathType Leaf) -and (Test-Path -LiteralPath $packagePath -PathType Leaf)) {
-      $packageItem = Get-Item -LiteralPath $packagePath
-      $candidates += [pscustomobject]@{
-        Path = $packageSkyRoot
-        LastWriteTime = $packageItem.LastWriteTime
-        Priority = 1
-      }
-    }
+  if (-not $script:RuntimeIdentityLogged) {
+    Write-Log "current CUA runtime identity ok: id=$runtimeId / root=$runtimeRoot"
+    $script:RuntimeIdentityLogged = $true
   }
-
-  # Prefer the extracted per-user runtime. Executables inside WindowsApps can
-  # be readable yet fail to spawn with EPERM from an ordinary PowerShell/Node
-  # process. The package copy remains a discovery fallback only.
-  $selected = @($candidates | Sort-Object Priority, @{ Expression = 'LastWriteTime'; Descending = $true } | Select-Object -First 1)
-  if ($selected.Count -eq 0) {
-    throw "no usable Codex CUA @oai/sky runtime was found under $runtimeRoot or the installed Codex package"
-  }
-
-  return $selected[0].Path
+  return $skyRoot
 }
 
 function Get-InstalledBundledMarketplaceRoot {
@@ -1490,6 +1576,12 @@ function Get-CurrentCodexAppServerRuntimeInventory {
     [string]$LocalCodexRoot = (Join-Path $env:LOCALAPPDATA 'OpenAI\Codex')
   )
 
+  $useDefaultInventory = -not $PSBoundParameters.ContainsKey('PackageResourcesRoot') -and
+    -not $PSBoundParameters.ContainsKey('LocalCodexRoot')
+  if ($useDefaultInventory -and $script:CurrentRuntimeInventory) {
+    return $script:CurrentRuntimeInventory
+  }
+
   if ([string]::IsNullOrWhiteSpace($PackageResourcesRoot)) {
     $package = Get-AppxPackage -Name OpenAI.Codex -ErrorAction SilentlyContinue |
       Sort-Object Version -Descending |
@@ -1545,10 +1637,11 @@ function Get-CurrentCodexAppServerRuntimeInventory {
   if ($LASTEXITCODE -ne 0 -or $nodeVersionOutput.Count -eq 0) {
     throw "current user-local CUA Node runtime is not executable: $($selectedCua.NodePath)"
   }
-  return [pscustomobject]@{
+  $inventory = [pscustomobject]@{
     CodexCliPath = $selectedCodex.Path
     NodePath = $selectedCua.NodePath
     NodeReplPath = $selectedCua.NodeReplPath
+    CuaRuntimeId = (Split-Path -Leaf (Split-Path -Parent $selectedCua.BinRoot))
     AllowedCodexCliPaths = @($codexCandidates | ForEach-Object { $_.Path })
     AllowedCuaBinRoots = @($cuaCandidates | ForEach-Object { $_.BinRoot })
     ReferenceCodexCliPath = $packageCodex
@@ -1556,6 +1649,10 @@ function Get-CurrentCodexAppServerRuntimeInventory {
     ReferenceNodeReplPath = $packageNodeRepl
     PackageResourcesRoot = $PackageResourcesRoot
   }
+  if ($useDefaultInventory) {
+    $script:CurrentRuntimeInventory = $inventory
+  }
+  return $inventory
 }
 
 function Resolve-ExistingFileProviderPath {
@@ -2591,7 +2688,7 @@ function Test-CodexConfig {
 
   Test-TomlSyntax $ConfigPath
   $expectedSource = '\\?\' + $MarketplaceRoot
-  $python = Get-Command python -ErrorAction SilentlyContinue | Select-Object -First 1
+  $python = Get-TomlPython
   if (-not $python) {
     $content = [System.IO.File]::ReadAllText($ConfigPath, [System.Text.UTF8Encoding]::new($false))
     if ($content -notmatch '(?ms)^\[marketplaces\.openai-bundled\]\s*\r?\n(?:(?!^\[).)*source_type\s*=\s*[''"]local[''"]') {
@@ -2609,11 +2706,17 @@ function Test-CodexConfig {
     if ($content -notmatch '(?ms)^\[windows\]\s*\r?\n(?:(?!^\[).)*sandbox\s*=\s*[''"]unelevated[''"]') {
       throw 'config.toml is missing windows.sandbox=unelevated'
     }
+    if ($content -notmatch '(?ms)^\[features\]\s*\r?\n(?:(?!^\[).)*computer_use\s*=\s*true') {
+      throw 'config.toml is missing features.computer_use=true'
+    }
+    if ($content -match '(?ms)^\[features\]\s*\r?\n(?:(?!^\[).)*(?:js_repl|js_repl_tools_only)\s*=\s*true') {
+      throw 'config.toml enables a retired js_repl feature; use the current code_mode/code_mode_host path'
+    }
     $pipeState = Get-ComputerUsePipeConfigState $ConfigPath
     if ($pipeState.Present -and -not $pipeState.Active) {
       throw 'config.toml contains stale SKY_CUA_NATIVE_PIPE environment override'
     }
-    Write-Log 'warning: python not found; config source path was not semantically validated'
+    Write-Log 'warning: no usable Python 3.11+ interpreter found outside WindowsApps; config source path was not semantically validated'
     return
   }
 
@@ -2652,6 +2755,15 @@ for plugin_id in required_plugin_ids:
     elif plugin.get("enabled") is not True:
         errors.append(f'plugins."{plugin_id}".enabled must be true')
 
+features = data.get("features", {})
+if not isinstance(features, dict):
+    errors.append("missing [features]")
+else:
+    if features.get("computer_use") is not True:
+        errors.append("features.computer_use must be true")
+    if features.get("js_repl") is True or features.get("js_repl_tools_only") is True:
+        errors.append("retired js_repl features must not be enabled")
+
 windows = data.get("windows", {})
 if not isinstance(windows, dict):
     errors.append("missing [windows]")
@@ -2687,16 +2799,86 @@ if errors:
   }
 }
 
+function Test-CodexFeatureState {
+  param([string]$CodexCliPath)
+
+  if (-not (Test-Path -LiteralPath $CodexCliPath -PathType Leaf)) {
+    throw "current user-local Codex CLI is missing: $CodexCliPath"
+  }
+
+  $output = @(& $CodexCliPath features list 2>&1)
+  if ($LASTEXITCODE -ne 0) {
+    throw "codex features list failed for the current user-local CLI: $CodexCliPath"
+  }
+
+  $features = @{}
+  foreach ($line in $output) {
+    $match = [regex]::Match([string]$line, '^\s*(?<name>\S+)\s+(?<status>.*?)\s+(?<enabled>true|false)\s*$')
+    if ($match.Success) {
+      $features[$match.Groups['name'].Value] = [pscustomobject]@{
+        Enabled = $match.Groups['enabled'].Value -eq 'true'
+        Status = $match.Groups['status'].Value.Trim()
+      }
+    }
+  }
+
+  if (-not $features.ContainsKey('computer_use') -or -not $features['computer_use'].Enabled) {
+    throw 'current Codex CLI does not report computer_use=true'
+  }
+  $trustedHost = @('code_mode_host', 'code_mode') |
+    Where-Object { $features.ContainsKey($_) -and $features[$_].Enabled } |
+    Select-Object -First 1
+  if (-not $trustedHost) {
+    throw 'current Codex CLI has neither code_mode_host nor code_mode enabled for the trusted Computer Use runtime'
+  }
+
+  $jsReplState = if ($features.ContainsKey('js_repl')) {
+    "$($features['js_repl'].Status)/$($features['js_repl'].Enabled.ToString().ToLowerInvariant())"
+  } else {
+    'absent'
+  }
+  Write-Log "feature state ok: computer_use=true / trusted_host=$trustedHost / js_repl=$jsReplState"
+}
+
+function Test-ActiveDesktopComputerUsePipe {
+  $pipes = @(
+    Get-ChildItem -LiteralPath '\\.\pipe\' -ErrorAction Stop |
+      Where-Object { $_.Name -like 'codex-computer-use-*' }
+  )
+  if ($pipes.Count -eq 0) {
+    throw 'no active Codex Desktop Computer Use native pipe was found; fully start/restart Desktop before strict verification or use -SkipDesktopPipeCheck only for offline fixture tests'
+  }
+
+  Write-Log "Desktop native pipe ready: count=$($pipes.Count) / names=$((@($pipes.Name) -join ','))"
+}
+
+function Get-ActiveDesktopComputerUsePipePath {
+  $pipes = @(
+    Get-ChildItem -LiteralPath '\\.\pipe\' -ErrorAction SilentlyContinue |
+      Where-Object { $_.Name -like 'codex-computer-use-*' }
+  )
+  if ($pipes.Count -eq 0) {
+    return $null
+  }
+  return [string]$pipes[0].FullName
+}
+
 function Test-HelperTransport {
   param(
     [string]$HelperTransportPath,
-    [string]$HelperCommandPath
+    [string]$HelperCommandPath,
+    [string]$NodePath
   )
 
-  $node = Get-Command node.exe -ErrorAction SilentlyContinue | Select-Object -First 1
+  $node = if (-not [string]::IsNullOrWhiteSpace($NodePath)) {
+    Get-Item -LiteralPath $NodePath -ErrorAction SilentlyContinue | Select-Object -First 1
+  } else {
+    Get-Command node.exe -ErrorAction SilentlyContinue | Select-Object -First 1
+  }
   if (-not $node) {
     throw 'node.exe not found; cannot verify local Computer Use helper transport'
   }
+  $nodeSource = if (-not [string]::IsNullOrWhiteSpace($NodePath)) { $NodePath } else { $node.Source }
 
   $script = @'
 import { pathToFileURL } from "node:url";
@@ -2727,7 +2909,41 @@ try {
   if (result == null || typeof result !== "object") {
     throw new Error(`invalid ${method} response: ${JSON.stringify(result)}`);
   }
-  console.log(JSON.stringify({ ok: true, method, resultType: Array.isArray(result) ? "array" : "object" }));
+  let windowCount = null;
+  if (method === "list_windows") {
+    const windows = Array.isArray(result)
+      ? result
+      : Array.isArray(result.windows)
+        ? result.windows
+        : null;
+    if (windows == null) {
+      throw new Error(`list_windows returned an unsupported shape: ${JSON.stringify(result)}`);
+    }
+    const invalidIndexes = windows.flatMap((window, index) => {
+      const valid =
+        window != null &&
+        typeof window === "object" &&
+        typeof window.app === "string" &&
+        window.app.trim().length > 0 &&
+        Number.isInteger(window.id) &&
+        window.id >= 0;
+      return valid ? [] : [index];
+    });
+    if (invalidIndexes.length > 0) {
+      throw new Error(
+        `list_windows violated the Window contract at indexes ${invalidIndexes.join(",")}; ` +
+          "window.app must be non-empty and window.id must be a non-negative integer",
+      );
+    }
+    windowCount = windows.length;
+  }
+  console.log(JSON.stringify({
+    ok: true,
+    method,
+    resultType: Array.isArray(result) ? "array" : "object",
+    windowContract: method === "list_windows" ? true : null,
+    windowCount,
+  }));
 } finally {
   if (typeof transport.close === "function") {
     await transport.close();
@@ -2737,7 +2953,7 @@ try {
   $temp = Join-Path $env:TEMP ('codex-computer-use-verify-' + [guid]::NewGuid().ToString('N') + '.mjs')
   try {
     Write-Utf8NoBom $temp $script
-    $output = & $node.Source $temp $HelperTransportPath $HelperCommandPath
+    $output = & $nodeSource $temp $HelperTransportPath $HelperCommandPath
     if ($LASTEXITCODE -ne 0) {
       throw "Computer Use helper transport verification failed for $HelperTransportPath"
     }
@@ -2749,13 +2965,22 @@ try {
   }
 }
 
-function Test-ComputerUseClientImport {
-  param([string]$ClientPath)
+function Test-ComputerUseClientWrapper {
+  param(
+    [string]$ClientPath,
+    [string]$DesktopPipePath,
+    [string]$NodePath
+  )
 
-  $node = Get-Command node.exe -ErrorAction SilentlyContinue | Select-Object -First 1
-  if (-not $node) {
-    throw 'node.exe not found; cannot verify Computer Use client import'
+  $node = if (-not [string]::IsNullOrWhiteSpace($NodePath)) {
+    Get-Item -LiteralPath $NodePath -ErrorAction SilentlyContinue | Select-Object -First 1
+  } else {
+    Get-Command node.exe -ErrorAction SilentlyContinue | Select-Object -First 1
   }
+  if (-not $node) {
+    throw 'node.exe not found; cannot verify Computer Use client wrapper'
+  }
+  $nodeSource = if (-not [string]::IsNullOrWhiteSpace($NodePath)) { $NodePath } else { $node.Source }
 
   $clientRoot = Split-Path -Parent (Split-Path -Parent $ClientPath)
   $runtimeNodeModules = Join-Path $clientRoot 'node_modules'
@@ -2767,42 +2992,34 @@ function Test-ComputerUseClientImport {
     }
   }
 
-  $script = @'
-import { pathToFileURL } from "node:url";
-
-globalThis.nodeRepl = {
-  config: {},
-  nativePipe: {},
-  env: {
-    NODE_REPL_NODE_MODULE_DIRS:
-      process.env.NODE_REPL_NODE_MODULE_DIRS ?? process.env.NODE_PATH ?? "",
-  },
-};
-
-const mod = await import(pathToFileURL(process.argv[2]).href);
-if (typeof mod.setupComputerUseRuntime !== "function") {
-  throw new Error("setupComputerUseRuntime export is missing");
-}
-console.log(JSON.stringify({ ok: true, exports: Object.keys(mod).sort() }));
-'@
-  $temp = Join-Path $env:TEMP ('codex-computer-use-client-import-' + [guid]::NewGuid().ToString('N') + '.mjs')
+  $probePath = Join-Path $PSScriptRoot 'probe-computer-use-client.mjs'
+  if (-not (Test-Path -LiteralPath $probePath -PathType Leaf)) {
+    throw "Computer Use client wrapper probe is missing: $probePath"
+  }
+  $mode = if ([string]::IsNullOrWhiteSpace($DesktopPipePath)) { 'fixture' } else { 'pipe' }
+  if ($mode -eq 'pipe' -and -not (Test-Path -LiteralPath $DesktopPipePath)) {
+    throw "Desktop Computer Use pipe disappeared before client wrapper verification: $DesktopPipePath"
+  }
   $tempClient = Join-Path $env:TEMP ('codex-computer-use-client-copy-' + [guid]::NewGuid().ToString('N') + '.mjs')
   $oldNodePath = [Environment]::GetEnvironmentVariable('NODE_PATH', 'Process')
   $oldNodeReplNodeModuleDirs = [Environment]::GetEnvironmentVariable('NODE_REPL_NODE_MODULE_DIRS', 'Process')
   try {
-    Write-Utf8NoBom $temp $script
     Copy-Item -LiteralPath $ClientPath -Destination $tempClient -Force
 
     # The Codex Node REPL resolves bare packages from runtime search roots, not
     # from the imported plugin file's local node_modules. Verify that shape.
     [Environment]::SetEnvironmentVariable('NODE_PATH', $runtimeNodeModules, 'Process')
     [Environment]::SetEnvironmentVariable('NODE_REPL_NODE_MODULE_DIRS', $runtimeNodeModules, 'Process')
-    $output = & $node.Source $temp $tempClient
+    $arguments = @($probePath, $tempClient, $runtimeNodeModules, $mode)
+    if ($mode -eq 'pipe') {
+      $arguments += $DesktopPipePath
+    }
+    $output = & $nodeSource @arguments
     if ($LASTEXITCODE -ne 0) {
-      throw "Computer Use client import verification failed for $ClientPath"
+      throw "Computer Use client wrapper verification failed for $ClientPath"
     }
     if ($output) {
-      Write-Log "client import ok: $output"
+      Write-Log "client wrapper ok ($mode): $output"
     }
   } finally {
     if ($null -eq $oldNodePath) {
@@ -2815,7 +3032,6 @@ console.log(JSON.stringify({ ok: true, exports: Object.keys(mod).sort() }));
     } else {
       [Environment]::SetEnvironmentVariable('NODE_REPL_NODE_MODULE_DIRS', $oldNodeReplNodeModuleDirs, 'Process')
     }
-    Remove-Item -LiteralPath $temp -Force -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath $tempClient -Force -ErrorAction SilentlyContinue
   }
 }
@@ -2823,9 +3039,10 @@ console.log(JSON.stringify({ ok: true, exports: Object.keys(mod).sort() }));
 function Test-ComputerUseRuntimeImport {
   param([string]$SkyRoot)
 
-  $node = Get-Command node.exe -ErrorAction SilentlyContinue | Select-Object -First 1
-  if (-not $node) {
-    throw 'node.exe not found; cannot verify the independent Computer Use runtime import'
+  $binRoot = Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $SkyRoot))
+  $nodePath = Join-Path $binRoot 'node.exe'
+  if (-not (Test-Path -LiteralPath $nodePath -PathType Leaf)) {
+    throw "current package-matching node.exe is missing: $nodePath"
   }
 
   $entryPath = Join-Path $SkyRoot 'dist\project\cua\sky_js\src\index.js'
@@ -2833,55 +3050,26 @@ function Test-ComputerUseRuntimeImport {
     throw "independent Computer Use runtime entry is missing: $entryPath"
   }
 
-  $script = @'
-globalThis.nodeRepl = {
-  config: {},
-  nativePipe: {},
-  env: {
-    NODE_REPL_NODE_MODULE_DIRS:
-      process.env.NODE_REPL_NODE_MODULE_DIRS ?? process.env.NODE_PATH ?? "",
-  },
-  notify: () => {},
-};
-const mod = await import(process.argv[2]);
-if (typeof mod.sky !== "object" || mod.sky === null) {
-  throw new Error("sky export is missing");
-}
-if (typeof mod.sky.list_windows !== "function") {
-  throw new Error("sky.list_windows export is missing");
-}
-const windows = await mod.sky.list_windows();
-if (!Array.isArray(windows)) {
-  throw new Error(`sky.list_windows returned ${typeof windows}`);
-}
-console.log(JSON.stringify({
-  ok: true,
-  exports: Object.keys(mod).sort(),
-  method: "list_windows",
-  resultType: "array",
-  count: windows.length,
-}));
-'@
-  $entryUri = ([Uri]$entryPath).AbsoluteUri
-  $temp = Join-Path $env:TEMP ('codex-computer-use-runtime-import-' + [guid]::NewGuid().ToString('N') + '.mjs')
-  try {
-    Write-Utf8NoBom $temp $script
-    $output = & $node.Source $temp $entryUri
-    if ($LASTEXITCODE -ne 0) {
-      throw "independent Computer Use runtime import verification failed for $entryPath"
-    }
-    if ($output) {
-      Write-Log "runtime import ok: $output"
-    }
-  } finally {
-    Remove-Item -LiteralPath $temp -Force -ErrorAction SilentlyContinue
+  $probePath = Join-Path $PSScriptRoot 'probe-computer-use-runtime.mjs'
+  if (-not (Test-Path -LiteralPath $probePath -PathType Leaf)) {
+    throw "Computer Use runtime probe is missing: $probePath"
+  }
+  $output = & $nodePath $probePath $entryPath
+  if ($LASTEXITCODE -ne 0) {
+    throw "independent Computer Use runtime import verification failed for $entryPath"
+  }
+  if ($output) {
+    Write-Log "runtime import ok: $output"
   }
 }
 
 function Test-OfficialComputerUseCache {
   param(
     [string]$CodexHomeResolved,
-    [string]$InstalledMarketplaceRoot
+    [string]$InstalledMarketplaceRoot,
+    [switch]$RequireDesktopPipe,
+    [string]$DesktopPipePath,
+    [string]$RuntimeNodePath
   )
 
   $sourceRoot = Join-Path $InstalledMarketplaceRoot 'plugins\computer-use'
@@ -2940,8 +3128,11 @@ function Test-OfficialComputerUseCache {
   if (Test-Path -LiteralPath $sourceClientPath -PathType Leaf) {
     $helperCommandPath = Join-Path $runtimeSkyRoot 'bin\windows\codex-computer-use.exe'
     $helperTransportPath = Join-Path $runtimeSkyRoot 'dist\project\cua\sky_js\src\targets\windows\internal\helper_transport.js'
-    Test-ComputerUseClientImport $cachedClientPath
-    Test-HelperTransport $helperTransportPath $helperCommandPath
+    if ($RequireDesktopPipe -and [string]::IsNullOrWhiteSpace($DesktopPipePath)) {
+      throw 'strict legacy Computer Use verification requires the active Desktop native pipe path'
+    }
+    Test-ComputerUseClientWrapper $cachedClientPath -DesktopPipePath $DesktopPipePath -NodePath $RuntimeNodePath
+    Test-HelperTransport $helperTransportPath $helperCommandPath -NodePath $RuntimeNodePath
   } else {
     Test-ComputerUseRuntimeImport $runtimeSkyRoot
   }
@@ -3022,12 +3213,37 @@ function Install-ComputerUse {
 }
 
 function Test-ComputerUse {
+  param([switch]$RequireDesktopPipe)
+
   $codexHomeResolved = Resolve-ExistingDirectory $CodexHome
   $installedMarketplaceRoot = Get-InstalledBundledMarketplaceRoot
   $installedChromeRoot = Join-Path $installedMarketplaceRoot 'plugins\chrome'
   $installedChromeVersion = Get-PluginVersion $installedChromeRoot
   $installedChromeCacheRoot = Join-Path $codexHomeResolved "plugins\cache\openai-bundled\chrome\$installedChromeVersion"
   $runtimeInventory = Get-CurrentCodexAppServerRuntimeInventory
+  $marketplaceRoot = Get-StableBundledMarketplaceRoot $codexHomeResolved
+  $desktopPipePath = $null
+  Test-CodexFeatureState $runtimeInventory.CodexCliPath
+  Test-CodexConfig (Join-Path $codexHomeResolved 'config.toml') $marketplaceRoot
+  Test-BundledMarketplaceMirror $marketplaceRoot
+  if ($RequireDesktopPipe) {
+    Test-ActiveDesktopComputerUsePipe
+    $desktopPipePath = Get-ActiveDesktopComputerUsePipePath
+  }
+
+  $userEnv = [Environment]::GetEnvironmentVariable('CODEX_ELECTRON_ENABLE_WINDOWS_COMPUTER_USE', 'User')
+  if ($userEnv -ne '1') {
+    throw 'CODEX_ELECTRON_ENABLE_WINDOWS_COMPUTER_USE is not enabled for the current user'
+  }
+  $detectedChromeUserDataDirectory = Get-ChromeUserDataDirectoryOverride
+  if (-not $detectedChromeUserDataDirectory) {
+    throw 'Chrome user data directory could not be detected'
+  }
+  $userChromeUserDataDirectory = [Environment]::GetEnvironmentVariable('CODEX_CHROME_USER_DATA_DIR', 'User')
+  if ($userChromeUserDataDirectory -ine $detectedChromeUserDataDirectory) {
+    throw "CODEX_CHROME_USER_DATA_DIR does not match the detected Chrome profile root: $detectedChromeUserDataDirectory"
+  }
+
   Test-ChromeNativeMessagingManifest $installedChromeCacheRoot
   Test-ChromeAppServerHostConfig $installedChromeCacheRoot $runtimeInventory
   Test-ChromeNativeHostV2State $installedChromeCacheRoot $runtimeInventory $codexHomeResolved
@@ -3051,12 +3267,12 @@ function Test-ComputerUse {
     # Current Codex builds can install a lightweight versioned plugin cache and
     # keep @oai/sky in the independent cua_node runtime. In that supported
     # layout `latest` can be absent or stale and has no usable node_modules.
-    Test-OfficialComputerUseCache $codexHomeResolved $installedMarketplaceRoot
+    Test-OfficialComputerUseCache $codexHomeResolved $installedMarketplaceRoot -RequireDesktopPipe:$RequireDesktopPipe -DesktopPipePath $desktopPipePath -RuntimeNodePath $runtimeInventory.NodePath
+    Write-Log 'local Computer Use verification ok: config/features/runtime/cache/window-contract'
     Write-Log 'verification ok'
     return
   }
 
-  $marketplaceRoot = Get-StableBundledMarketplaceRoot $codexHomeResolved
   $manifestPath = Join-Path $marketplaceRoot '.agents\plugins\marketplace.json'
   $cacheLatest = Join-Path $codexHomeResolved 'plugins\cache\openai-bundled\computer-use\latest'
   $browserPluginRoot = Join-Path $marketplaceRoot 'plugins\browser'
@@ -3170,30 +3386,14 @@ function Test-ComputerUse {
     throw 'computer-use marketplace entry does not point to ./plugins/computer-use'
   }
 
-  Test-BundledMarketplaceMirror $marketplaceRoot
-
-  $userEnv = [Environment]::GetEnvironmentVariable('CODEX_ELECTRON_ENABLE_WINDOWS_COMPUTER_USE', 'User')
-  if ($userEnv -ne '1') {
-    throw 'CODEX_ELECTRON_ENABLE_WINDOWS_COMPUTER_USE is not enabled for the current user'
-  }
-
-  $detectedChromeUserDataDirectory = Get-ChromeUserDataDirectoryOverride
-  if (-not $detectedChromeUserDataDirectory) {
-    throw 'Chrome user data directory could not be detected'
-  }
-  $userChromeUserDataDirectory = [Environment]::GetEnvironmentVariable('CODEX_CHROME_USER_DATA_DIR', 'User')
-  if ($userChromeUserDataDirectory -ine $detectedChromeUserDataDirectory) {
-    throw "CODEX_CHROME_USER_DATA_DIR does not match the detected Chrome profile root: $detectedChromeUserDataDirectory"
-  }
-
-  Test-CodexConfig (Join-Path $codexHomeResolved 'config.toml') $marketplaceRoot
-  Test-ComputerUseClientImport $computerUseClientPath
-  Test-HelperTransport $helperTransportPath
+  Test-ComputerUseClientWrapper $computerUseClientPath -DesktopPipePath $desktopPipePath -NodePath $runtimeInventory.NodePath
+  Test-HelperTransport $helperTransportPath -NodePath $runtimeInventory.NodePath
+  Write-Log 'local Computer Use verification ok: config/features/runtime/cache/window-contract'
   Write-Log 'verification ok'
 }
 
 if ($StrictVerifyOnly) {
-  Test-ComputerUse
+  Test-ComputerUse -RequireDesktopPipe:(-not $SkipDesktopPipeCheck)
   exit 0
 }
 

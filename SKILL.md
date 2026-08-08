@@ -1,6 +1,6 @@
 ---
 name: codex-windows-fast-patch
-description: Reapply and repair Windows Codex Desktop after Store upgrades, including custom provider models hidden by Statsig available_models filtering, the dependent blue-purple Power slider and its Ultra toggle, Fast Mode request/UI gates, locale i18n, plugin UI gates, Chrome/browser_use gates, Goal command gates, Windows Computer Use availability gates and plugin/runtime repair, phone remote-control pairing under third-party/API-key main app usage, Desktop dynamicTools/inputSchema thread-start schema drift, local conversation visibility recovery after model_provider switches, restored-conversation missing-cwd continuation repair, ASAR integrity repair, signing/installing patched MSIX packages, SDK cleanup, Fast Mode wire verification, local plugin marketplace registration, and optional custom model_instructions_file setup.
+description: Diagnose, reapply, and verify Windows Codex Desktop repairs after Store upgrades, including hidden custom-provider models, the Power slider and Ultra toggle, Fast Mode request/UI gates, locale i18n, plugin and Goal gates, Chrome/browser_use, Windows Computer Use availability/runtime/bootstrap/window-contract failures, phone remote control with third-party providers, dynamicTools/inputSchema drift, local conversation provider/cwd recovery, ASAR/MSIX repair, signing, SDK cleanup, wire verification, local marketplaces, and optional model_instructions_file setup.
 ---
 
 # Codex Windows Fast Patch
@@ -21,29 +21,17 @@ Before doing substantive work with this skill, run the bundled self-update helpe
 powershell -NoProfile -ExecutionPolicy Bypass -File "$env:USERPROFILE\.codex\skills\codex-windows-fast-patch\scripts\update-skill-from-github.ps1"
 ```
 
-The helper checks `chen0416ccc-cpu/codex-windows-fast-patch-skill` on GitHub and synchronizes only the skill allowlist: `SKILL.md`, `agents`, `scripts`, `references`, and `assets`. 如果无法更新到最新版，则不要中断当前任务；继续使用本机已安装的当前版本完成工作，并在结果中说明未能更新。
+The helper checks `chen0416ccc-cpu/codex-windows-fast-patch-skill` on GitHub and synchronizes only the skill allowlist: `SKILL.md`, `agents`, `scripts`, `references`, and `assets`. If the root contains `.skill-local-overrides`, the helper reports the remote version but refuses to overwrite the customized copy unless `-Force` is explicitly supplied after a backup and diff review. 如果无法更新到最新版，则不要中断当前任务；继续使用本机已安装的当前版本完成工作，并在结果中说明未能更新。
 
 If the normal workflow does not explain a restriction, plugin gate, Computer Use failure, browser_use failure, or Fast Mode failure, read `references/restriction-debug-cases.md` before editing scripts or repatching.
 If the task is phone remote control, QR pairing, mobile setup, isolated remote OAuth, remote-control WebSocket, or post-pairing API endpoint diagnosis, read `references/remote-control-debug-cases.md` before editing scripts or repatching.
+If Computer Use local verification passes but task injection, screenshots, actions, browser control, or provider support remain unproven, read `references/computer-use-e2e-validation.md` before claiming success.
 
 ## Config Backup Rule
 
 Before any action that can modify, regenerate, or overwrite `$env:USERPROFILE\.codex\config.toml`, create one timestamped backup of the current file for the task. This applies whether the agent uses bundled scripts, writes TOML manually, runs another helper, registers a marketplace, changes MCP servers, or repairs Computer Use.
 
-The bundled scripts already back up an existing `config.toml` once per script run before their first write. If not using those scripts, do the backup explicitly before touching the file:
-
-```powershell
-$config = Join-Path $env:USERPROFILE '.codex\config.toml'
-if (Test-Path -LiteralPath $config -PathType Leaf) {
-  $backupDir = Join-Path (Split-Path -Parent $config) 'backups\config'
-  New-Item -ItemType Directory -Force -Path $backupDir | Out-Null
-  $backup = Join-Path $backupDir ('config.toml.' + (Get-Date -Format 'yyyyMMdd-HHmmss-fff') + '.manual.bak')
-  Copy-Item -LiteralPath $config -Destination $backup -Force
-  Write-Host "config.toml backup before overwrite: $backup"
-}
-```
-
-Do not proceed with a config write if the backup of an existing config fails. After writing, validate TOML syntax with `tomllib` when Python is available.
+The bundled scripts back up an existing `config.toml` once before their first write. For any manual write, copy it first to `.codex\backups\config\config.toml.<yyyyMMdd-HHmmss-fff>.manual.bak`. Stop if the backup fails, and validate the result with `tomllib` when a real Python 3.11+ interpreter is available outside the WindowsApps alias.
 
 ## Workflow Selection
 
@@ -60,7 +48,7 @@ Before choosing the full MSIX repack path, identify whether the current failure 
 - Use the targeted bundled marketplace repair when the newest Desktop logs show fewer descriptors than the current package marketplace, or show `not_in_bundled_marketplace_plugin_names` removing a plugin the user had already installed. Descriptor presence means a plugin is available; it does not authorize installing or enabling optional plugins such as `sites`, `latex`, `deep-research`, or `visualize`. This should not trigger a broad repatch or Phone Remote Control workflow.
 - If the user asks for Phone Remote Control and ordinary Desktop features in the same repair, patch Phone Remote Control first, then verify Fast Mode/browser/Chrome/Computer Use. If the remote-control MSIX install disturbs Computer Use or Chrome native-host state, immediately run the Computer Use Only workflow and re-run `-StrictVerifyOnly`.
 - Do not infer that a new `resources\codex.exe` PE file means `app.asar` is gone or that Computer Use needs binary patching. Inspect the current package resources first. If `app.asar` still exists and the symptom is a plugin/runtime import or cache failure, run `scripts\install-computer-use-local.ps1` before considering MSIX or binary changes.
-- After a Computer Use-only repair, always run `scripts\install-computer-use-local.ps1 -StrictVerifyOnly`. Legacy layouts pass with `client import ok` plus `helper transport ok`; descriptor-only layouts pass with `runtime import ok` after importing the official `sky` export and calling `list_windows`.
+- After a Computer Use-only repair, run `scripts\install-computer-use-local.ps1 -VerifyOnly`, fully start/restart Desktop, then run `-StrictVerifyOnly`. Strict mode requires a live Desktop native pipe, a current package-matching runtime, an enabled trusted Code Mode host, and valid `{app,id}` values for every returned Window. Use `-SkipDesktopPipeCheck` only for offline fixtures; it downgrades the result to local-only evidence.
 - Do not put Phone Remote Control into the default full repatch path unless the user asked for it. It is an opt-in workflow because it can require isolated remote-control OAuth, ASAR changes, a native app-server replacement binary, SQLite enrollment cleanup, and post-pairing API endpoint diagnosis.
 - If evidence is mixed, use the lowest-disruption path first: run read-only triage, then `scripts\install-computer-use-local.ps1 -VerifyOnly` for local plugin evidence, restart Codex Desktop only if needed, and escalate to MSIX only when logs or extracted ASAR checks still show a closed gate.
 
@@ -99,7 +87,7 @@ If `-StrictVerifyOnly` fails on a missing marketplace manifest, missing plugin f
 powershell -NoProfile -ExecutionPolicy Bypass -File "$env:USERPROFILE\.codex\skills\codex-windows-fast-patch\scripts\install-computer-use-local.ps1" -VerifyOnly
 ```
 
-This local repair may update config, plugin cache, Chrome native host paths and origins, user environment, and helper runtime files, but it does not uninstall or reinstall the Codex MSIX package. It invokes the current Chrome plugin's official `scripts\installManifest.mjs` with a user-local Codex CLI whose hash matches the installed package and with matching current `cua_node` `node.exe` / `node_repl.exe` paths. That official installer writes the outer native-host manifest, registry value, and required `extension-host-config.json`. The repair also synchronizes the current schema-2 app-server entry into both `%LOCALAPPDATA%\OpenAI\Codex\chrome-native-hosts-v2.json` and `$env:USERPROFILE\.codex\chrome-native-hosts-v2.json` using the current plugin's NUL-separated SHA-256 identity contract. Strict verification requires the exact current origin set from `scripts\extension-ids.json`, a stable current-version Chrome cache, existing current runtime paths in the host config, and a valid current entry in both v2 state files.
+This local repair may update config, plugin cache, Chrome native host paths and origins, user environment, and helper runtime files, but it does not uninstall or reinstall the Codex MSIX package. It invokes the current Chrome plugin's official `scripts\installManifest.mjs` with a user-local Codex CLI whose hash matches the installed package and matching current `cua_node` `node.exe` / `node_repl.exe` paths. It preserves unrelated TOML keys, enables `features.computer_use`, removes retired `js_repl` entries, and avoids the WindowsApps Python alias during optional TOML validation. Strict verification checks current origins, native-host state, current runtime identity, the Window contract, and a live Desktop pipe; it is not by itself proof of tool injection or UI actions.
 
 4. Before choosing a full MSIX repack, check whether this is the bundled marketplace fast path. Compare the package's `.agents\plugins\marketplace.json` names with the Desktop reconcile log. If descriptors are missing, or `not_in_bundled_marketplace_plugin_names` removes a plugin the user had already installed, run only the targeted bundled marketplace patch on a large local drive:
 
@@ -451,42 +439,11 @@ After configuring `model_instructions_file`, restart Codex CLI/Desktop or start 
 
 ## Computer Use Only
 
-Use this path for local Computer Use plugin/runtime repair without repacking the MSIX. It rebuilds the local `openai-bundled` marketplace mirror, repairs stable `computer-use` / `browser` / `chrome` / `sites` cache links from one pinned installed-package source, overlays the installed CUA `@oai/sky` runtime into the local Computer Use plugin, patches localized/default-value Chrome registry parsing and the Computer Use client import shape when needed, preserves a live `SKY_CUA_NATIVE_PIPE` configuration while removing stale overrides, updates the Chrome native messaging host and both schema-2 app-server state files to current stable cache/runtime paths, and verifies the client import or independent runtime transport.
+Use this path for local Computer Use and Chrome runtime repair without repacking the MSIX. It pins files to the installed package, repairs stable caches and native-host state, preserves unrelated plugin state and TOML keys, and rejects stale runtime identities.
 
-If Windows 10 reaches the native helper but screenshot capture fails specifically at `SetIsBorderRequired` with `0x80004002`, inspect the helper profile before rerunning the general local repair:
+Run `scripts\install-computer-use-local.ps1 -VerifyOnly`, fully start/restart Desktop, then run `scripts\install-computer-use-local.ps1 -StrictVerifyOnly` for the read-only strict check.
 
-```powershell
-$helperPatcher = "$env:USERPROFILE\.codex\skills\codex-windows-fast-patch\scripts\patch-computer-use-helper-win10.ps1"
-powershell -NoProfile -ExecutionPolicy Bypass -File $helperPatcher
-```
-
-Only an `original-patchable` result for one of the documented complete helper SHA-256 profiles authorizes the targeted write. The current profiles are `@oai/sky 0.4.20` validated with Desktop `26.707.12708.0` and `@oai/sky 0.5.2` validated with Desktop `26.721.4979.0`; the helper hash, not the Desktop version, is the compatibility boundary:
-
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File $helperPatcher -Install
-```
-
-The patcher verifies the complete output hash, stores the original under `.codex\backups\computer-use-helper`, and supports `-Rollback`. After installation, continue with `-VerifyOnly`, `-StrictVerifyOnly`, and real Explorer/Task Manager Computer Use captures. Do not apply the profile to an unknown helper hash.
-
-To refresh only the local Windows Computer Use files and environment gate:
-
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File "$env:USERPROFILE\.codex\skills\codex-windows-fast-patch\scripts\install-computer-use-local.ps1"
-```
-
-To verify and automatically repair missing local Computer Use files:
-
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File "$env:USERPROFILE\.codex\skills\codex-windows-fast-patch\scripts\install-computer-use-local.ps1" -VerifyOnly
-```
-
-To verify without changing files:
-
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File "$env:USERPROFILE\.codex\skills\codex-windows-fast-patch\scripts\install-computer-use-local.ps1" -StrictVerifyOnly
-```
-
-If `-StrictVerifyOnly` fails because a cache path is missing or stale, run `-VerifyOnly` once, then rerun `-StrictVerifyOnly`. If `-VerifyOnly` succeeds but Desktop still reports native pipe unavailable, restart Codex Desktop and inspect the newest Desktop log for `computer-use native pipe startup ready`.
+If strict verification fails on local state, run `-VerifyOnly` once and retry after Desktop starts. If it passes, continue with `references/computer-use-e2e-validation.md`; local/runtime success must not be reported as real task injection or UI control. Legacy layouts must also report the standard `setupComputerUseRuntime()` wrapper calling `sky.list_windows()`; a helper transport probe alone is insufficient. For isolated regressions, run `scripts\test-computer-use-client-wrapper.ps1 -TemporaryRoot <temporary-root>` and `scripts\test-computer-use-config-preservation.ps1 -TemporaryRoot <temporary-root>`; these fixtures never use live Desktop state. For Windows 10 `SetIsBorderRequired ... 0x80004002`, use `references/win10-computer-use-screenshot-backend.md` and patch only an exact supported helper hash.
 
 ## Backup Management
 
@@ -519,7 +476,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "$env:USERPROFILE\.codex\ski
 - Any configured local marketplace used for personal plugins has a supported `.agents\plugins\marketplace.json`; root-level `marketplace.json` alone is not enough for the current plugin CLI.
 - `codex plugin list` shows the plugins required by the requested repair, including `browser@openai-bundled`, `chrome@openai-bundled`, and `computer-use@openai-bundled` for Browser/Chrome/Computer Use work, as `installed, enabled`. Optional plugins retain their prior state.
 - When `-VerifyAllBundledPluginsAvailable` is requested, every complete descriptor in the stable `openai-bundled` marketplace has the same name and version as the installed package and appears with that version in the union of CLI `installed` and `available` JSON entries with an existing local source; no optional plugin becomes installed or enabled as a side effect.
-- Recent Desktop logs retain the current package's bundled descriptor names and do not show `not_in_bundled_marketplace_plugin_names` removing a plugin that was already installed.
+- Startup-correlated Desktop logs retain the current package's bundled descriptor names and do not show `not_in_bundled_marketplace_plugin_names`, `bundled_plugins_reconcile_failed`, or `already added from a different source` for the current process. Prompt/trace keyword echoes are not runtime evidence.
 - `$env:USERPROFILE\.codex\config.toml` contains `[plugins."computer-use@openai-bundled"]` with `enabled = true`.
 - `codex plugin list` shows `computer-use@openai-bundled` as `installed, enabled`.
 - If Chrome/browser use is required, `codex plugin list` shows `chrome@openai-bundled` and `browser@openai-bundled` as `installed, enabled`, the Chrome native messaging host manifest points to a stable current-version cache rather than `.tmp\bundled-marketplaces`, and its origins exactly match the current `extension-ids.json`. The `extension-host.exe` directory contains `extension-host-config.json` with schema 1, the current package-matching user-local `codex.exe`, and current same-runtime `node.exe` / `node_repl.exe` paths. Both `%LOCALAPPDATA%\OpenAI\Codex\chrome-native-hosts-v2.json` and `$env:USERPROFILE\.codex\chrome-native-hosts-v2.json` contain the same current schema-2 entry, official NUL-separated SHA-256 identity, installed-package `resourcesPath`, and existing runtime/cache paths. `chrome\latest` and `browser\latest` (when present) resolve to stable version directories, and a real smoke test can read a controlled tab title such as `Example Domain`.
@@ -527,8 +484,9 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "$env:USERPROFILE\.codex\ski
 - `CODEX_ELECTRON_ENABLE_WINDOWS_COMPUTER_USE` is set to `1` for the current user.
 - `$env:USERPROFILE\.codex\config.toml` contains `[features]` with `computer_use = true`.
 - `$env:USERPROFILE\.codex\config.toml` contains `[windows]` with `sandbox = "unelevated"`, and the sandbox command syntax shown by `codex sandbox --help` succeeds.
-- The Computer Use plugin cache matches the installed package. Support both legacy `computer-use\latest\node_modules\@oai\sky` and the current lightweight versioned or descriptor-only cache plus `%LOCALAPPDATA%\OpenAI\Codex\runtimes\cua_node`; validation reaches `list_windows` either through the helper transport or the official independent runtime export.
-- `scripts\install-computer-use-local.ps1 -StrictVerifyOnly` logs `client import ok` and `helper transport ok` for legacy layouts, or `runtime import ok` with `method=list_windows` for descriptor-only layouts.
+- The Computer Use cache and selected user-local runtime match the current installed package by file identity. Do not select an older runtime by directory time or execute a WindowsApps runtime fallback.
+- `scripts\install-computer-use-local.ps1 -StrictVerifyOnly` logs the current runtime ID, `computer_use=true`, an enabled `code_mode_host`/`code_mode`, a live Desktop native pipe, and `windowContract=true` with zero invalid Window objects. Legacy layouts also log `client wrapper ok (pipe)` after the standard setup/list_windows path. `-SkipDesktopPipeCheck` is allowed only for offline fixture tests and does not prove Desktop bootstrap.
+- Complete Computer Use acceptance follows `references/computer-use-e2e-validation.md` and reports separate statuses for local runtime, Desktop bootstrap, plugin injection, capture, action, browser smoke, and provider-native support. `list_windows` alone is not end-to-end proof.
 - For a supported Windows 10 screenshot-helper profile, `scripts\patch-computer-use-helper-win10.ps1` reports `patched` with the selected profile's complete output SHA-256, its original backup matches the profile's complete input SHA-256, repeated static captures do not grow helper resources linearly, and dynamic captures produce changing image data. The documented pairs are `0.4.20`: `F2B2F56F...` -> `71A13CBC...`, and `0.5.2`: `2C4CAC16...` -> `D816B14A...`.
 - The patched ASAR has the Computer Use availability and install gates forced local-available. On newer builds these targets can be merged into `webview\assets\app-initial-*.js` instead of the older `use-is-plugins-enabled-*` and `use-plugin-install-flow-*` chunks.
 - The patched ASAR has the Fast Mode UI gate unblocked, the locale chunk with `enable_i18n` forced enabled, and browser_use feature chunks/main feature dispatch patched to report in-app and external browser availability locally. Codex Desktop `26.721.3996.0` can merge the Fast UI, model visibility, and Browser sidebar targets into `webview\assets\app-initial-*.js`.

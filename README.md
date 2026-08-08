@@ -41,7 +41,11 @@
 - `scripts/patch-remote-control-windows-msix.ps1`：手机远控 MSIX / ASAR 补丁和 marker 校验参考实现。
 - `scripts/patch-remote-control-asar.cjs`：手机远控 Electron bundle patcher。
 - `scripts/build-remote-control-native-replacement.ps1`：当 native app-server 因 API-key 主认证拒绝手机远控时，在指定工作目录下构建 patched `app\resources\codex.exe` replacement。默认从安装包副本自动识别原生版本；内置映射包括在 Desktop `26.715.2305.0` 上完成精确 tag 构建、安装和手机端到端实测的 `0.145.0-alpha.18`，在 Desktop `26.707.3748.0` 上完成同类验证的 `0.144.0-alpha.4`，以及仅通过 patch-apply 验证的历史 `0.142.4`。其他版本必须提供严格匹配的 `-CodexSourceRef`、`-AppServerVersion` 和已验证的 `-PatchPathOverride`。
-- `scripts/install-computer-use-local.ps1`：Windows Computer Use 与 Chrome 本地运行时安装和校验参考实现；兼容旧式 `latest + plugin-local node_modules` 和新版“版本缓存 + `%LOCALAPPDATA%` 独立 cua_node runtime”布局，并同步 Chrome 外层 native-host manifest、`extension-host-config.json` 与两份 schema-2 app-server 状态文件。
+- `scripts/install-computer-use-local.ps1`：Windows Computer Use 与 Chrome 本地运行时修复和分层校验；只接受与当前安装包哈希匹配的用户态 runtime，保留同表 TOML 键，避开 WindowsApps Python alias，并在严格模式检查活跃 Desktop pipe 和窗口对象契约。
+- `scripts/probe-computer-use-runtime.mjs`：只输出脱敏统计的 `sky.list_windows` runtime/window-contract 探针；不会输出窗口标题。
+- `scripts/probe-computer-use-client.mjs`：legacy 客户端探针；会调用标准 `setupComputerUseRuntime()`，再通过 live Desktop pipe 或明确标记的离线 fixture 调用 `sky.list_windows()`，只输出契约统计。
+- `scripts/test-computer-use-config-preservation.ps1`：隔离验证 TOML 写入、无关键保留、UTF-8 无 BOM 和重复键拒绝；不触碰真实 Desktop 状态。
+- `scripts/test-computer-use-client-wrapper.ps1`：离线回归验证 legacy wrapper 初始化和 `{app,id}` 契约拒绝逻辑；不安装插件、不触碰真实 Desktop 状态。
 - `scripts/patch-computer-use-helper-win10.ps1`：为精确支持哈希的 `@oai/sky 0.4.20` 和 `0.5.2` helper 提供只读识别、安装和回滚；`26.707.12708.0` 与 `26.721.4979.0` 是各自的端到端验证基线，不是版本门槛。
 - `scripts/sync-codex-provider-history.ps1`：同步本地会话 provider 元数据，让切换 `model_provider` 后消失的会话重新出现在官方列表中；也可用 `-RepairMissingCwdDirs` 修复恢复后会话无法继续的缺失 `cwd` 目录。默认不改 `config.toml`，也不改 workspace/project roots。
 - `scripts/install-model-instructions-file.ps1`：可选安装内置 `model_instructions_file` 提示词资源。
@@ -49,6 +53,7 @@
 - `scripts/update-skill-from-github.ps1`：使用前尽力同步 GitHub 最新版本的自更新脚本。
 - `assets/system-prompt.md`：仅在用户明确要求可选提示词配置时使用的内置提示词资源。
 - `references/restriction-debug-cases.md`：限制解除、Chrome/browser_use、Computer Use 和 Fast Mode 的按需诊断案例。
+- `references/computer-use-e2e-validation.md`：Computer Use 本地 runtime、Desktop bootstrap、工具注入、窗口截图/动作、浏览器 smoke test 与供应商原生 `computer_call` 的分层验收流程。
 - `references/win10-computer-use-screenshot-backend.md`：Win10 原生截图 helper 的 `0x80004002`、`FrameArrived` 死锁、补丁边界和验收证据。
 - `references/remote-control-debug-cases.md`：手机远控配对、隔离授权、native app-server 网络、版本过期状态和配对后 API 地址诊断案例。
 - `references/remote-control-native-replacement.patch`：手机远控 native app-server replacement 使用的 Rust 源码参考补丁。
@@ -81,7 +86,7 @@ Copy-Item -Recurse -Force -LiteralPath (Join-Path $source 'assets') -Destination
 
 安装后，让支持 Agent Skills 的智能体使用 `codex-windows-fast-patch` 工作流处理当前机器上的 Codex Desktop 问题。
 
-这个 skill 支持自更新：智能体每次正式使用前会先尝试从 GitHub 检查并同步最新版本。网络不可用、GitHub 访问失败或下载失败时，更新步骤会被跳过，智能体应继续使用当前本地版本处理问题。
+这个 skill 支持自更新：智能体每次正式使用前会先尝试从 GitHub 检查并同步最新版本。带有 `.skill-local-overrides` 标记的定制副本默认只报告可用更新，不会覆盖本地改动；只有审阅差异并备份后显式传入 `-Force` 才会同步。网络不可用、GitHub 访问失败或下载失败时，更新步骤会被跳过，智能体应继续使用当前本地版本处理问题。
 
 这些脚本是参考实现和操作模板，不是跨所有机器都能直接运行的一键方案。实际处理时应先读取 `SKILL.md`，检查当前机器的 Codex 安装方式、MSIX 包路径、ASAR 内容、签名工具、插件目录、Computer Use 文件状态和远控相关日志，再决定执行、改写或只借鉴其中步骤。
 
@@ -142,7 +147,11 @@ Copy-Item -Recurse -Force -LiteralPath (Join-Path $source 'assets') -Destination
 - 补丁日志包含 `fast-mode UI patch result`、`locale i18n patch result` 和 `browser-use gate patch result`，结果为 `patched` 或 `already-patched`。
 - Fast Mode 本地线缆验证能在 `/v1/responses` 的 HTTP 请求体或 WebSocket 帧里捕获 `service_tier=priority`；如果 `codex exec` 未发出请求，验证器会回退到 app-server，并额外确认 `thread/start serviceTier=priority`。
 - 如果本次修复包含浏览器和 Computer Use，`codex plugin list` 应显示 `browser`、`chrome`、`computer-use` 为 `installed, enabled`；`sites`、`latex`、`deep-research`、`visualize` 等无关可选插件必须保留用户原有状态。给主 wrapper 加 `-VerifyAllBundledPluginsAvailable` 会在正常修复/DryRun 流程中附加 availability 断言，校验稳定镜像与当前安装包的 descriptor 名称和版本一致，并校验 CLI JSON 报告相同版本；断言本身不联网下载、不执行 `plugin add`、不启用可选插件，但 wrapper 的其它修复步骤仍可能写入状态。完全只读时直接运行 `install-computer-use-local.ps1 -StrictVerifyOnly -VerifyAllBundledPluginsAvailable`。
-- Desktop 日志应保留当前安装包的 bundled descriptor 名称，并且不应通过 `not_in_bundled_marketplace_plugin_names` 删除用户原本已安装的插件；descriptor 存在不等于插件已安装。
+- `-StrictVerifyOnly` 还应报告当前安装包匹配的 runtime ID、`computer_use=true`、可信 `code_mode_host`/`code_mode`、活跃 Desktop native pipe，以及 `windowContract=true` 且无非法窗口对象。`-SkipDesktopPipeCheck` 只用于离线测试，不能证明 Desktop bootstrap。
+- legacy 布局还必须报告 `client wrapper ok (pipe)`，证明标准 `setupComputerUseRuntime()` -> `sky.list_windows()` 路径经过活跃管道；没有管道时只允许在明确标记的 fixture 模式下验证。
+- 配置写入器回归可在下载副本中运行 `scripts\test-computer-use-config-preservation.ps1 -TemporaryRoot <临时目录>`；它只使用隔离 fixture，检查 TOML 语义、UTF-8 无 BOM、保留无关键和重复键拒绝，不触碰真实 Desktop 配置。
+- Desktop 日志必须按当前包路径、PID/process UUID 和启动时间关联；应保留当前 descriptor，且当前进程不再出现 `not_in_bundled_marketplace_plugin_names`、`bundled_plugins_reconcile_failed` 或 marketplace 双源冲突。提示词和工具命令中的同名文本不算日志证据。
+- `StrictVerifyOnly` 通过只代表本地/runtime/Desktop pipe 层通过。完整结果按 `references/computer-use-e2e-validation.md` 分别记录工具注入、截图、真实动作、`example.com` 浏览器 smoke test 和供应商原生 Computer Use，不能用 `list_windows` 代替端到端成功。
 - 如果本次修复包含浏览器能力，Desktop 日志里 `browser_use_availability_resolved` 显示 `available=true` 和 `reason=local-patched`。
 - 如果修复 Win10 截图 helper，patcher 应报告已验证 patched SHA-256；Explorer 首帧/连续帧、任务管理器动态帧、文字读取、窗口枚举和预热后资源稳定性都应通过。
 - 如果需要 Chrome 控制，`codex plugin list` 显示 `chrome@openai-bundled` 为 `installed, enabled`；native messaging host manifest 的路径和注册表值指向当前稳定缓存；`allowed_origins` 与缓存 `scripts\extension-ids.json` 顶层 ID 精确一致；`extension-host-config.json` 包含与当前安装包匹配的本地 `codex.exe` 以及同一当前运行时的 `node.exe` / `node_repl.exe`；`%LOCALAPPDATA%\OpenAI\Codex\chrome-native-hosts-v2.json` 与 `%USERPROFILE%\.codex\chrome-native-hosts-v2.json` 都包含当前版本、官方哈希身份和全部现存路径。随后真实 smoke test 应能读到受控标签页标题，例如 `Example Domain`。Chrome 未运行时，无需再次征得用户授权，直接自动启动后验证 `https://example.com/`、`Example Domain` 标题和唯一且文本匹配的 `h1`。

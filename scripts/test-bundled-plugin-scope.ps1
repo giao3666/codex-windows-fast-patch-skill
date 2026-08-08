@@ -21,7 +21,10 @@ function Get-TrackedPluginState {
   foreach ($name in $trackedPluginNames) {
     $entry = @($entries | Where-Object { $_.name -eq $name } | Select-Object -First 1)
     if ($entry.Count -eq 0) {
-      throw "Bundled plugin is missing from CLI output: $name"
+      # Optional bundled plugins can be intentionally absent from a specific
+      # Desktop package. Preserve that state rather than treating it as drift.
+      $state[$name] = 'not-offered'
+      continue
     }
     $state[$name] = "installed=$([bool]$entry[0].installed);enabled=$([bool]$entry[0].enabled)"
   }
@@ -57,7 +60,7 @@ $ErrorActionPreference = 'Continue'
 try {
   $availabilityOutput = @(
     & powershell -NoProfile -ExecutionPolicy Bypass -File $installer `
-      -StrictVerifyOnly -VerifyAllBundledPluginsAvailable 2>&1
+      -StrictVerifyOnly -VerifyAllBundledPluginsAvailable -SkipDesktopPipeCheck 2>&1
   )
   $availabilityExitCode = $LASTEXITCODE
 } finally {

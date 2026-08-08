@@ -212,7 +212,7 @@ Checks:
 Action:
 
 - Run `scripts\install-computer-use-local.ps1 -VerifyOnly` to rebuild the local bundled plugin mirror, stable cache links, CUA runtime overlay, Chrome native host paths, and config cleanup.
-- Run `scripts\install-computer-use-local.ps1 -StrictVerifyOnly` immediately after. Legacy layouts require `client import ok` and `helper transport ok`; descriptor-only layouts require `runtime import ok` with a real `sky.list_windows` array result.
+- Run `scripts\install-computer-use-local.ps1 -StrictVerifyOnly` immediately after. Legacy layouts require `client wrapper ok (pipe)` from the standard `setupComputerUseRuntime()` -> `sky.list_windows()` path plus `helper transport ok`; descriptor-only layouts require `runtime import ok` with a real `sky.list_windows` array result. An ordinary import check or helper-only probe is insufficient.
 - If `-StrictVerifyOnly` fails because a cache link or plugin file is missing, rerun `-VerifyOnly` once, then rerun `-StrictVerifyOnly`.
 - In 26.609-style caches, `browser\latest` or `chrome\latest` may be absent while the versioned cache directory still exists. Do not treat that as a Computer Use failure by itself; require the versioned browser/chrome plugin manifests and only validate a support-plugin `latest` junction when it exists.
 - If verification succeeds but Desktop still reports native pipe unavailable, fully quit and relaunch Codex Desktop, then inspect the newest Desktop log for `computer-use native pipe startup ready`.

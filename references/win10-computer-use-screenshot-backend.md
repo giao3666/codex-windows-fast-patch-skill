@@ -113,7 +113,7 @@ The helper profile passed the following Windows 10 tests on Desktop `26.707.1270
 | Dynamic capture | Three Task Manager performance frames two seconds apart produced three distinct image-data hashes. |
 | Accessibility | Explorer tree length `8708`, including `Antigravity`. |
 | Window enumeration | Explorer and Task Manager both returned by `list_windows`. |
-| Local plugin verification | `client import ok`, `helper transport ok`, and `verification ok`. |
+| Local plugin verification | `client wrapper ok (pipe)`, `helper transport ok`, and `verification ok`. |
 
 ### `@oai/sky 0.5.2` / Desktop 26.721 validation
 
@@ -123,7 +123,7 @@ Desktop `26.721.4979.0` introduced `@oai/sky 0.5.2` with original helper SHA-256
 - The optional-interface path, callback guards, import slots, and executable tail padding were independently located in `0.5.2`. The reconstructed offline result remained a valid x64 PE, differed by the same `169` bytes, and produced complete output SHA-256 `D816B14A80370697380BA702863DA9528AA5B73ED34C2B189ACE2BF9E103BEFF`.
 - Disassembly of the reconstructed wrapper resolved to the new `CreateThread`, `CloseHandle`, `RoInitialize`, and `RoUninitialize` IAT slots and the new original callback address. No `WindowsApps` file was edited in place.
 - An isolated lifecycle test passed `original -> patched -> idempotent install -> rollback -> idempotent rollback`. The live install stored the original at `.codex\backups\computer-use-helper\26.721.4979.0-sky-0.5.2-2C4CAC16\codex-computer-use.exe.original`, then verified the complete patched hash. A transient first install attempt encountered a still-closing helper image lock and left the live hash unchanged; the patcher now waits up to five seconds for each stopped helper process before replacement.
-- `install-computer-use-local.ps1 -VerifyOnly` and `-StrictVerifyOnly` both returned `client import ok`, `helper transport ok`, and `verification ok`, without replacing the patched helper.
+- `install-computer-use-local.ps1 -VerifyOnly` and `-StrictVerifyOnly` both returned the legacy wrapper, helper transport, and verification markers (older runs called the first marker `client import ok`), without replacing the patched helper.
 
 | Test | Result |
 | --- | --- |
@@ -145,7 +145,7 @@ The Store upgrade to Desktop `26.715.2305.0` (`codex-cli 0.145.0-alpha.18`) was 
 - Fast Mode wire verification reached `/v1/responses` with `service_tier=priority`.
 - The Fast verifier used the copied work-package CLI because the installed WindowsApps CLI was not directly executable under the package ACL; no manual `PATH` override was required after the verifier fallback was added.
 - The selected `@oai/sky 0.4.20` runtime helper remained at the documented patched SHA-256; no binary rewrite or cross-version helper copy was needed.
-- `install-computer-use-local.ps1 -StrictVerifyOnly` passed with `client import ok`, `helper transport ok`, and a `1920x1080` screenshot transport.
+- `install-computer-use-local.ps1 -StrictVerifyOnly` passed with the legacy wrapper marker, `helper transport ok`, and a `1920x1080` screenshot transport.
 - Current-startup Desktop logs reported `computer-use native pipe startup ready`, browser availability as `reason=local-patched`, and all seven bundled plugins in the runtime marketplace, without the documented negative marketplace/helper-path markers.
 
 The later Store upgrade to Desktop `26.715.3651.0` (the same `codex-cli 0.145.0-alpha.18`) was rechecked on 2026-07-18. No new ASAR patch target was required:

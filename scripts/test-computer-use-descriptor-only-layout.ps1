@@ -58,6 +58,9 @@ if (-not $text.Contains($expectedCurrentCacheMarker)) {
 if ($text -notmatch 'runtime import ok: .*"exports":\["sky"\].*"method":"list_windows"') {
   throw "descriptor-only repair did not verify the official @oai/sky list_windows API: $text"
 }
+if ($text -notmatch 'runtime import ok: .*"windowContract":true.*"invalidWindowCount":0') {
+  throw "descriptor-only repair did not verify the Window app/id contract: $text"
+}
 
 $cacheDescriptor = Join-Path $env:USERPROFILE ".codex\plugins\cache\openai-bundled\computer-use\$pluginVersion\.codex-plugin\plugin.json"
 if (-not (Test-Path -LiteralPath $cacheDescriptor -PathType Leaf)) {

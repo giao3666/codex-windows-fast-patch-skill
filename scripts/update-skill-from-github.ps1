@@ -134,6 +134,13 @@ try {
     exit 0
   }
 
+  $localOverrideMarker = Join-Path $skillRoot '.skill-local-overrides'
+  if ((Test-Path -LiteralPath $localOverrideMarker -PathType Leaf) -and -not $Force) {
+    Write-Log "local override marker found: $localOverrideMarker"
+    Write-Log 'automatic self-update stopped to preserve local changes; review the upstream diff and pass -Force only after backing up this skill'
+    exit 0
+  }
+
   $tempRoot = Join-Path ([System.IO.Path]::GetTempPath()) ('codex-skill-update-' + [guid]::NewGuid().ToString('N'))
   $zipPath = Join-Path $tempRoot 'source.zip'
   New-Item -ItemType Directory -Force -Path $tempRoot | Out-Null
